@@ -12,6 +12,7 @@ import requests
 import json
 import base64
 import hashlib
+import snowflake.connector
 from datetime import datetime, date
 from pathlib import Path
 
@@ -30,30 +31,50 @@ CHARCOAL = "#2D2D2D"
 USERS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_APP_USERS"
 
 
-# ─── Snowflake Connection (uses st.connection built into Streamlit Cloud) ───
-def get_conn():
-    """Get Snowflake connection via Streamlit's native connector."""
-    return st.connection("snowflake")
+# ─── Snowflake Connection ───
+@st.cache_resource
+def get_snowflake_conn():
+    """Get Snowflake connection for user auth."""
+    return snowflake.connector.connect(
+        account=st.secrets["snowflake"]["account"],
+        user=st.secrets["snowflake"]["user"],
+        password=st.secrets["snowflake"]["password"],
+        warehouse=st.secrets["snowflake"]["warehouse"],
+        role=st.secrets["snowflake"]["role"],
+    )
 
 
 def run_query(sql: str, params: tuple = None):
     """Execute a query and return results as list of tuples."""
-    conn = get_conn()
-    if params:
-        # Substitute %s params manually for Snowpark session.sql()
-        for p in params:
-            sql = sql.replace("%s", f"'{p}'", 1)
-    df = conn.query(sql)
-    return [tuple(row) for row in df.itertuples(index=False, name=None)]
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        return cur.fetchall()
+    except Exception:
+        # Reconnect on stale connection
+        st.cache_resource.clear()
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        cur.close()
 
 
 def run_dml(sql: str, params: tuple = None):
     """Execute DML (INSERT/UPDATE) statement."""
-    conn = get_conn()
-    if params:
-        for p in params:
-            sql = sql.replace("%s", f"'{p}'", 1)
-    conn.query(sql)
+    conn = get_snowflake_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+    except Exception:
+        st.cache_resource.clear()
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        cur.execute(sql, params)
+    finally:
+        cur.close()
 
 
 # ─── Employee Directory ───

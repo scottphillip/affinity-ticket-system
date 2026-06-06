@@ -5,7 +5,7 @@ Standalone Streamlit app for submitting data requests, bug reports,
 and feature requests. Sends tickets directly to scott.phillips@affinitysales.com
 via Microsoft Graph API.
 
-Users log in with their company email (validated against employee directory).
+Users log in with their company email + password (stored in Snowflake).
 """
 import streamlit as st
 import requests
@@ -14,6 +14,8 @@ import base64
 import hashlib
 from datetime import datetime, date
 from pathlib import Path
+
+import snowflake.connector
 
 st.set_page_config(
     page_title="Submit a Request | Affinity Group",
@@ -24,6 +26,50 @@ st.set_page_config(
 # Brand colors
 ORANGE = "#F5921E"
 CHARCOAL = "#2D2D2D"
+
+USERS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_APP_USERS"
+
+
+# ─── Snowflake Connection ───
+@st.cache_resource
+def get_snowflake_conn():
+    """Get Snowflake connection for user auth."""
+    return snowflake.connector.connect(
+        account=st.secrets["snowflake"]["account"],
+        user=st.secrets["snowflake"]["user"],
+        password=st.secrets["snowflake"]["password"],
+        warehouse=st.secrets["snowflake"]["warehouse"],
+        role=st.secrets["snowflake"]["role"],
+    )
+
+
+def run_query(sql: str, params: tuple = None):
+    """Execute a query and return results."""
+    conn = get_snowflake_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+    except snowflake.connector.errors.DatabaseError:
+        # Reconnect on stale connection
+        st.cache_resource.clear()
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def run_dml(sql: str, params: tuple = None):
+    """Execute DML (INSERT/UPDATE) statement."""
+    conn = get_snowflake_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+    except snowflake.connector.errors.DatabaseError:
+        st.cache_resource.clear()
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        cur.execute(sql, params)
 
 
 # ─── Employee Directory ───
@@ -37,44 +83,46 @@ def load_employee_directory():
     return {}
 
 
-# ─── Password Storage ───
-# Passwords stored in secrets as a pre-built dict, OR users set on first login.
-# For Streamlit Cloud, passwords persist via secrets TOML.
-# Fallback: session-only passwords (user re-enters each session).
-
-def get_stored_passwords() -> dict:
-    """Get password hashes from secrets (if configured)."""
-    try:
-        return dict(st.secrets.get("passwords", {}))
-    except Exception:
-        return {}
-
-
+# ─── Auth Functions ───
 def hash_password(password: str) -> str:
-    """Simple SHA-256 hash for password storage."""
+    """SHA-256 hash for password storage."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-def verify_login(email: str, password: str) -> bool:
-    """Verify email is in directory and password matches (if passwords configured)."""
-    directory = load_employee_directory()
-    email_lower = email.strip().lower()
+def check_user_exists(email: str) -> bool:
+    """Check if user has an account in Snowflake."""
+    rows = run_query(
+        f"SELECT 1 FROM {USERS_TABLE} WHERE EMAIL = %s",
+        (email,)
+    )
+    return len(rows) > 0
 
-    # Must be in employee directory
-    if email_lower not in directory:
+
+def verify_password(email: str, password: str) -> bool:
+    """Verify password against stored hash."""
+    rows = run_query(
+        f"SELECT PASSWORD_HASH FROM {USERS_TABLE} WHERE EMAIL = %s",
+        (email,)
+    )
+    if not rows:
         return False
+    return rows[0][0] == hash_password(password)
 
-    # Check stored passwords
-    stored = get_stored_passwords()
-    if stored:
-        stored_hash = stored.get(email_lower)
-        if stored_hash:
-            return hash_password(password) == stored_hash
-        # Email in directory but no password set yet - allow first login
-        return True
 
-    # No password system configured - just validate email is in directory
-    return True
+def create_user(email: str, display_name: str, password: str):
+    """Create a new user account."""
+    run_dml(
+        f"INSERT INTO {USERS_TABLE} (EMAIL, DISPLAY_NAME, PASSWORD_HASH) VALUES (%s, %s, %s)",
+        (email, display_name, hash_password(password))
+    )
+
+
+def update_last_login(email: str):
+    """Update last login timestamp."""
+    run_dml(
+        f"UPDATE {USERS_TABLE} SET LAST_LOGIN = CURRENT_TIMESTAMP() WHERE EMAIL = %s",
+        (email,)
+    )
 
 
 # ─── Microsoft Graph Email ───
@@ -183,7 +231,7 @@ def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_na
 
 # ─── LOGIN PAGE ───
 def show_login():
-    """Display the login form."""
+    """Display the login/register form."""
     st.markdown(f"""
     <div style="background: {CHARCOAL}; padding: 15px 25px; border-radius: 10px; margin-bottom: 25px;">
         <span style="color: {ORANGE}; font-size: 22px; font-weight: bold;">AFFINITY GROUP</span>
@@ -191,77 +239,65 @@ def show_login():
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("### Sign In")
-    st.markdown("Enter your Affinity Group email and password to continue.")
+    tab_login, tab_register = st.tabs(["Sign In", "Create Account"])
 
-    with st.form("login_form"):
-        email = st.text_input("Email", placeholder="yourname@affinitysales.com")
-        password = st.text_input("Password", type="password", placeholder="Enter your password")
-        col_login, col_register = st.columns(2)
-        with col_login:
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="yourname@affinitysales.com", key="login_email")
+            password = st.text_input("Password", type="password", key="login_pw")
             login_btn = st.form_submit_button("Sign In", use_container_width=True, type="primary")
-        with col_register:
-            register_btn = st.form_submit_button("Create Account", use_container_width=True)
 
-    if login_btn:
-        if not email or not password:
-            st.error("Please enter both email and password.")
-            return
+        if login_btn:
+            if not email or not password:
+                st.error("Please enter both email and password.")
+            else:
+                email_lower = email.strip().lower()
+                directory = load_employee_directory()
 
-        email_lower = email.strip().lower()
-        directory = load_employee_directory()
+                if email_lower not in directory:
+                    st.error("Email not found in the Affinity Group directory.")
+                elif not check_user_exists(email_lower):
+                    st.warning("No account found for this email. Please create an account first.")
+                elif not verify_password(email_lower, password):
+                    st.error("Incorrect password.")
+                else:
+                    update_last_login(email_lower)
+                    st.session_state.logged_in = True
+                    st.session_state.user_email = email_lower
+                    st.session_state.user_name = directory[email_lower]
+                    st.rerun()
 
-        if email_lower not in directory:
-            st.error("Email not found in the Affinity Group directory. "
-                     "Please use your company email address.")
-            return
+    with tab_register:
+        with st.form("register_form"):
+            reg_email = st.text_input("Email", placeholder="yourname@affinitysales.com", key="reg_email")
+            reg_pw = st.text_input("Create Password", type="password", key="reg_pw")
+            reg_pw2 = st.text_input("Confirm Password", type="password", key="reg_pw2")
+            register_btn = st.form_submit_button("Create Account", use_container_width=True, type="primary")
 
-        # Check password against session store
-        if "user_passwords" not in st.session_state:
-            st.session_state.user_passwords = get_stored_passwords()
+        if register_btn:
+            if not reg_email or not reg_pw:
+                st.error("Please fill in all fields.")
+            elif reg_pw != reg_pw2:
+                st.error("Passwords do not match.")
+            elif len(reg_pw) < 4:
+                st.error("Password must be at least 4 characters.")
+            else:
+                email_lower = reg_email.strip().lower()
+                directory = load_employee_directory()
 
-        stored_hash = st.session_state.user_passwords.get(email_lower)
-        if stored_hash and stored_hash != hash_password(password):
-            st.error("Incorrect password. Please try again.")
-            return
-
-        if not stored_hash:
-            # First time - save their password
-            st.session_state.user_passwords[email_lower] = hash_password(password)
-
-        # Login success
-        st.session_state.logged_in = True
-        st.session_state.user_email = email_lower
-        st.session_state.user_name = directory[email_lower]
-        st.rerun()
-
-    if register_btn:
-        if not email or not password:
-            st.error("Please enter both email and password to create your account.")
-            return
-
-        email_lower = email.strip().lower()
-        directory = load_employee_directory()
-
-        if email_lower not in directory:
-            st.error("Email not found in the Affinity Group directory. "
-                     "Only Affinity Group employees can create accounts.")
-            return
-
-        if len(password) < 4:
-            st.error("Password must be at least 4 characters.")
-            return
-
-        # Store password
-        if "user_passwords" not in st.session_state:
-            st.session_state.user_passwords = get_stored_passwords()
-
-        st.session_state.user_passwords[email_lower] = hash_password(password)
-        st.session_state.logged_in = True
-        st.session_state.user_email = email_lower
-        st.session_state.user_name = directory[email_lower]
-        st.success(f"Account created! Welcome, {directory[email_lower]}.")
-        st.rerun()
+                if email_lower not in directory:
+                    st.error("Email not found in the Affinity Group directory. "
+                             "Only Affinity Group employees can create accounts.")
+                elif check_user_exists(email_lower):
+                    st.warning("An account already exists for this email. Please sign in instead.")
+                else:
+                    create_user(email_lower, directory[email_lower], reg_pw)
+                    update_last_login(email_lower)
+                    st.session_state.logged_in = True
+                    st.session_state.user_email = email_lower
+                    st.session_state.user_name = directory[email_lower]
+                    st.success(f"Account created! Welcome, {directory[email_lower]}.")
+                    st.rerun()
 
 
 # ─── TICKET FORM (after login) ───

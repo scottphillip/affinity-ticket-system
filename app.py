@@ -194,7 +194,7 @@ def mark_ticket_complete(ticket_id: int):
 def try_send_email(ticket: dict, attachment_data: bytes = None, attachment_name: str = None) -> bool:
     """Send ticket notification via Snowflake's built-in email system."""
     try:
-        subject = f"[{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}"
+        subject = f"[TICKET] [{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}"
         body = (
             f"New ticket submitted:\n\n"
             f"From: {ticket['submitter_name']} ({ticket['submitter_email']})\n"

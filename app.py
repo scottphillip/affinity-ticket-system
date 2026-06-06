@@ -27,6 +27,7 @@ CHARCOAL = "#2D2D2D"
 USERS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_APP_USERS"
 TICKETS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_LOG"
 ADMIN_EMAIL = "scott.phillips@affinitysales.com"
+APP_URL = "https://affinity-ticket-system.streamlit.app"
 
 
 # ─── Snowflake Connection ───
@@ -128,8 +129,8 @@ def update_last_login(email: str):
 
 
 # ─── Ticket Functions ───
-def save_ticket(ticket: dict):
-    """Save ticket to Snowflake log table."""
+def save_ticket(ticket: dict) -> int:
+    """Save ticket to Snowflake log table. Returns the new ticket ID."""
     run_dml(
         f"""INSERT INTO {TICKETS_TABLE}
             (SUBMITTER_EMAIL, SUBMITTER_NAME, REQUEST_TYPE, PRIORITY, DUE_DATE, DESCRIPTION)
@@ -143,6 +144,9 @@ def save_ticket(ticket: dict):
             ticket["description"],
         )
     )
+    # Get the ID of the ticket we just inserted
+    rows = run_query(f"SELECT MAX(TICKET_ID) FROM {TICKETS_TABLE}")
+    return rows[0][0] if rows else 0
 
 
 def get_user_tickets(email: str):
@@ -191,18 +195,21 @@ def mark_ticket_complete(ticket_id: int):
 
 
 # ─── Email Notification (via Snowflake SYSTEM$SEND_EMAIL) ───
-def try_send_email(ticket: dict, attachment_data: bytes = None, attachment_name: str = None) -> bool:
+def try_send_email(ticket: dict, ticket_id: int) -> bool:
     """Send ticket notification via Snowflake's built-in email system."""
     try:
+        complete_url = f"{APP_URL}/?complete={ticket_id}"
         subject = f"[TICKET] [{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}"
         body = (
-            f"New ticket submitted:\n\n"
+            f"New ticket submitted (#{ticket_id}):\n\n"
             f"From: {ticket['submitter_name']} ({ticket['submitter_email']})\n"
             f"Type: {ticket['request_type']}\n"
             f"Priority: {ticket['priority']}\n"
             f"Due: {ticket.get('due_date', 'Not specified')}\n"
             f"Submitted: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n\n"
-            f"Description:\n{ticket['description']}"
+            f"Description:\n{ticket['description']}\n\n"
+            f"---\n"
+            f"Mark Complete: {complete_url}"
         )
         # Escape single quotes for SQL
         subject_safe = subject.replace("'", "''")
@@ -394,10 +401,10 @@ def show_main_app():
 
                 with st.spinner("Submitting your request..."):
                     # Always save to database first
-                    save_ticket(ticket)
+                    ticket_id = save_ticket(ticket)
 
                     # Try email (best-effort)
-                    email_sent = try_send_email(ticket, attach_bytes, attach_name)
+                    email_sent = try_send_email(ticket, ticket_id)
 
                     if email_sent:
                         st.success("Your request has been submitted and the team has been notified!")
@@ -481,6 +488,22 @@ def show_main_app():
 
 
 # ─── MAIN ───
+# Handle "Mark Complete" link from email
+params = st.query_params
+if "complete" in params:
+    ticket_id_param = params["complete"]
+    if st.session_state.get("logged_in") and st.session_state.get("user_email") == ADMIN_EMAIL:
+        try:
+            mark_ticket_complete(int(ticket_id_param))
+            st.query_params.clear()
+            st.success(f"Ticket #{ticket_id_param} marked as complete!")
+        except Exception:
+            st.error("Could not complete ticket. Please use the Admin tab.")
+    elif not st.session_state.get("logged_in"):
+        st.info("Please sign in to mark this ticket complete.")
+        show_login()
+        st.stop()
+
 if st.session_state.get("logged_in"):
     show_main_app()
 else:

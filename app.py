@@ -27,7 +27,7 @@ CHARCOAL = "#2D2D2D"
 USERS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_APP_USERS"
 TICKETS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_LOG"
 ADMIN_EMAIL = "scott.phillips@affinitysales.com"
-APP_URL = "https://affinity-ticket-system.streamlit.app"
+APP_URL = "https://affinity-ticket-system-6fphpygble6rytav26s8eb.streamlit.app"
 
 
 # ─── Snowflake Connection ───

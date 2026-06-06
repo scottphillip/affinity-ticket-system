@@ -2,8 +2,8 @@
 Affinity Group - Ticket Submission System
 =========================================
 Standalone Streamlit app for submitting data requests, bug reports,
-and feature requests. Sends tickets directly to scott.phillips@affinitysales.com
-via Microsoft Graph API.
+and feature requests. Tickets are logged to Snowflake and optionally
+sent via email to scott.phillips@affinitysales.com.
 
 Users log in with their company email + password (stored in Snowflake).
 """
@@ -16,8 +16,6 @@ import snowflake.connector
 from datetime import datetime, date
 from pathlib import Path
 
-
-
 st.set_page_config(
     page_title="Submit a Request | Affinity Group",
     page_icon="🎫",
@@ -29,6 +27,8 @@ ORANGE = "#F5921E"
 CHARCOAL = "#2D2D2D"
 
 USERS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_APP_USERS"
+TICKETS_TABLE = "DB_PROD_TRF.SCH_TRF_UTILS.TB_TICKET_LOG"
+ADMIN_EMAIL = "scott.phillips@affinitysales.com"
 
 
 # ─── Snowflake Connection ───
@@ -52,7 +52,6 @@ def run_query(sql: str, params: tuple = None):
         cur.execute(sql, params)
         return cur.fetchall()
     except Exception:
-        # Reconnect on stale connection
         st.cache_resource.clear()
         conn = get_snowflake_conn()
         cur = conn.cursor()
@@ -130,108 +129,147 @@ def update_last_login(email: str):
     )
 
 
-# ─── Microsoft Graph Email ───
-def get_graph_token() -> str:
-    """Get OAuth2 token for Microsoft Graph API."""
-    tenant_id = st.secrets["graph"]["tenant_id"]
-    client_id = st.secrets["graph"]["client_id"]
-    client_secret = st.secrets["graph"]["client_secret"]
+# ─── Ticket Functions ───
+def save_ticket(ticket: dict):
+    """Save ticket to Snowflake log table."""
+    run_dml(
+        f"""INSERT INTO {TICKETS_TABLE}
+            (SUBMITTER_EMAIL, SUBMITTER_NAME, REQUEST_TYPE, PRIORITY, DUE_DATE, DESCRIPTION)
+            VALUES (%s, %s, %s, %s, %s, %s)""",
+        (
+            ticket["submitter_email"],
+            ticket["submitter_name"],
+            ticket["request_type"],
+            ticket["priority"],
+            ticket["due_date"],
+            ticket["description"],
+        )
+    )
 
-    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://graph.microsoft.com/.default",
-    }
-    response = requests.post(token_url, data=payload)
-    response.raise_for_status()
-    return response.json()["access_token"]
+
+def get_user_tickets(email: str):
+    """Get all tickets for a user."""
+    return run_query(
+        f"""SELECT TICKET_ID, REQUEST_TYPE, PRIORITY, DESCRIPTION, STATUS, CREATED_AT, DUE_DATE
+            FROM {TICKETS_TABLE}
+            WHERE SUBMITTER_EMAIL = %s
+            ORDER BY CREATED_AT DESC""",
+        (email,)
+    )
 
 
-def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_name: str = None) -> bool:
-    """Send ticket as formatted email via Microsoft Graph."""
-    token = get_graph_token()
-    sender = st.secrets["graph"]["sender_email"]
-    recipient = st.secrets["graph"]["recipient_email"]
+def get_all_open_tickets():
+    """Get all open tickets (admin view)."""
+    return run_query(
+        f"""SELECT TICKET_ID, SUBMITTER_NAME, SUBMITTER_EMAIL, REQUEST_TYPE, PRIORITY,
+                   DESCRIPTION, CREATED_AT, DUE_DATE
+            FROM {TICKETS_TABLE}
+            WHERE STATUS = 'OPEN'
+            ORDER BY
+                CASE PRIORITY WHEN 'Urgent' THEN 1 WHEN 'High' THEN 2
+                     WHEN 'Medium' THEN 3 ELSE 4 END,
+                CREATED_AT ASC"""
+    )
 
-    priority_colors = {
-        "Low": "#4CAF50",
-        "Medium": "#FF9800",
-        "High": "#F44336",
-        "Urgent": "#9C27B0",
-    }
-    p_color = priority_colors.get(ticket["priority"], "#666")
 
-    html_body = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <div style="background: {CHARCOAL}; padding: 15px 20px; border-radius: 8px 8px 0 0;">
-            <span style="color: {ORANGE}; font-size: 18px; font-weight: bold;">TICKET</span>
-            <span style="color: white; font-size: 18px;"> SUBMISSION</span>
+def get_completed_tickets():
+    """Get completed tickets (admin view)."""
+    return run_query(
+        f"""SELECT TICKET_ID, SUBMITTER_NAME, REQUEST_TYPE, PRIORITY, DESCRIPTION,
+                   CREATED_AT, COMPLETED_AT
+            FROM {TICKETS_TABLE}
+            WHERE STATUS = 'COMPLETED'
+            ORDER BY COMPLETED_AT DESC
+            LIMIT 50"""
+    )
+
+
+def mark_ticket_complete(ticket_id: int):
+    """Mark a ticket as completed."""
+    run_dml(
+        f"UPDATE {TICKETS_TABLE} SET STATUS = 'COMPLETED', COMPLETED_AT = CURRENT_TIMESTAMP() WHERE TICKET_ID = %s",
+        (ticket_id,)
+    )
+
+
+# ─── Microsoft Graph Email (best-effort) ───
+def try_send_email(ticket: dict, attachment_data: bytes = None, attachment_name: str = None) -> bool:
+    """Attempt to send ticket email. Returns True if sent, False if failed."""
+    try:
+        tenant_id = st.secrets["graph"]["tenant_id"]
+        client_id = st.secrets["graph"]["client_id"]
+        client_secret = st.secrets["graph"]["client_secret"]
+        sender = st.secrets["graph"]["sender_email"]
+        recipient = st.secrets["graph"]["recipient_email"]
+    except (KeyError, Exception):
+        return False
+
+    try:
+        # Get token
+        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+        }
+        resp = requests.post(token_url, data=payload, timeout=10)
+        resp.raise_for_status()
+        token = resp.json()["access_token"]
+
+        # Build email
+        priority_colors = {"Low": "#4CAF50", "Medium": "#FF9800", "High": "#F44336", "Urgent": "#9C27B0"}
+        p_color = priority_colors.get(ticket["priority"], "#666")
+
+        html_body = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <div style="background: {CHARCOAL}; padding: 15px 20px; border-radius: 8px 8px 0 0;">
+                <span style="color: {ORANGE}; font-size: 18px; font-weight: bold;">TICKET</span>
+                <span style="color: white; font-size: 18px;"> SUBMISSION</span>
+            </div>
+            <div style="border: 1px solid #ddd; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr><td style="padding: 8px 0; font-weight: bold; width: 140px; color: #555;">Submitted By:</td>
+                        <td style="padding: 8px 0;">{ticket['submitter_name']} ({ticket['submitter_email']})</td></tr>
+                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Request Type:</td>
+                        <td style="padding: 8px 0;">{ticket['request_type']}</td></tr>
+                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Priority:</td>
+                        <td style="padding: 8px 0;"><span style="background: {p_color}; color: white; padding: 3px 10px; border-radius: 12px; font-size: 13px;">{ticket['priority']}</span></td></tr>
+                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Due Date:</td>
+                        <td style="padding: 8px 0;">{ticket.get('due_date', 'Not specified')}</td></tr>
+                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Submitted:</td>
+                        <td style="padding: 8px 0;">{datetime.now().strftime('%B %d, %Y at %I:%M %p')}</td></tr>
+                </table>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;">
+                <p style="font-weight: bold; color: #555; margin-bottom: 5px;">Description:</p>
+                <div style="background: #f9f9f9; padding: 12px; border-radius: 6px; white-space: pre-wrap;">{ticket['description']}</div>
+            </div>
         </div>
-        <div style="border: 1px solid #ddd; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
-            <table style="width: 100%; border-collapse: collapse;">
-                <tr>
-                    <td style="padding: 8px 0; font-weight: bold; width: 140px; color: #555;">Submitted By:</td>
-                    <td style="padding: 8px 0;">{ticket['submitter_name']} ({ticket['submitter_email']})</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; font-weight: bold; color: #555;">Request Type:</td>
-                    <td style="padding: 8px 0;">{ticket['request_type']}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; font-weight: bold; color: #555;">Priority:</td>
-                    <td style="padding: 8px 0;">
-                        <span style="background: {p_color}; color: white; padding: 3px 10px; border-radius: 12px; font-size: 13px;">
-                            {ticket['priority']}
-                        </span>
-                    </td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; font-weight: bold; color: #555;">Due Date:</td>
-                    <td style="padding: 8px 0;">{ticket.get('due_date', 'Not specified')}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; font-weight: bold; color: #555;">Submitted:</td>
-                    <td style="padding: 8px 0;">{datetime.now().strftime('%B %d, %Y at %I:%M %p')}</td>
-                </tr>
-            </table>
-            <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;">
-            <p style="font-weight: bold; color: #555; margin-bottom: 5px;">Description:</p>
-            <div style="background: #f9f9f9; padding: 12px; border-radius: 6px; white-space: pre-wrap;">{ticket['description']}</div>
-        </div>
-    </div>
-    """
+        """
 
-    message = {
-        "message": {
-            "subject": f"[{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}",
-            "body": {
-                "contentType": "HTML",
-                "content": html_body,
+        message = {
+            "message": {
+                "subject": f"[{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}",
+                "body": {"contentType": "HTML", "content": html_body},
+                "toRecipients": [{"emailAddress": {"address": recipient}}],
             },
-            "toRecipients": [{"emailAddress": {"address": recipient}}],
-        },
-        "saveToSentItems": "true",
-    }
+            "saveToSentItems": "true",
+        }
 
-    if attachment_data and attachment_name:
-        encoded = base64.b64encode(attachment_data).decode("utf-8")
-        message["message"]["attachments"] = [
-            {
+        if attachment_data and attachment_name:
+            encoded = base64.b64encode(attachment_data).decode("utf-8")
+            message["message"]["attachments"] = [{
                 "@odata.type": "#microsoft.graph.fileAttachment",
                 "name": attachment_name,
                 "contentBytes": encoded,
-            }
-        ]
+            }]
 
-    url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(url, headers=headers, json=message)
-    return response.status_code in (200, 202)
+        url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        resp = requests.post(url, headers=headers, json=message, timeout=15)
+        return resp.status_code in (200, 202)
+    except Exception:
+        return False
 
 
 # ─── LOGIN PAGE ───
@@ -305,12 +343,14 @@ def show_login():
                     st.rerun()
 
 
-# ─── TICKET FORM (after login) ───
-def show_ticket_form():
-    """Display the ticket submission form for logged-in users."""
+# ─── MAIN APP (after login) ───
+def show_main_app():
+    """Display the main app with tabs for logged-in users."""
     user_name = st.session_state.user_name
     user_email = st.session_state.user_email
+    is_admin = (user_email == ADMIN_EMAIL)
 
+    # Header
     st.markdown(f"""
     <div style="background: {CHARCOAL}; padding: 15px 25px; border-radius: 10px; margin-bottom: 25px;">
         <span style="color: {ORANGE}; font-size: 22px; font-weight: bold;">AFFINITY GROUP</span>
@@ -330,86 +370,162 @@ def show_ticket_form():
             st.rerun()
 
     st.markdown("---")
-    st.markdown("Submit a request for data additions, fixes, feature requests, or bug reports. "
-                "Your ticket will be sent directly to the data engineering team.")
 
-    # Form
-    with st.form("ticket_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+    # Tabs
+    if is_admin:
+        tab_submit, tab_my_tickets, tab_admin = st.tabs(["Submit Request", "My Tickets", "Admin - All Tickets"])
+    else:
+        tab_submit, tab_my_tickets = st.tabs(["Submit Request", "My Tickets"])
 
-        with col1:
-            request_type = st.selectbox(
-                "Request Type *",
-                options=[
-                    "Data Fix / Correction",
-                    "Feature Request",
-                    "Bug Report",
-                    "Report / Dashboard Request",
-                    "Order Management Update",
-                    "Order Management New Feature",
-                    "CRM Update",
-                    "Match File",
-                    "Dist Code Import",
-                    "Other",
-                ],
+    # ── Submit Request Tab ──
+    with tab_submit:
+        st.markdown("Submit a request for data additions, fixes, feature requests, or bug reports.")
+
+        with st.form("ticket_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                request_type = st.selectbox(
+                    "Request Type *",
+                    options=[
+                        "Data Fix / Correction",
+                        "Feature Request",
+                        "Bug Report",
+                        "Report / Dashboard Request",
+                        "Order Management Update",
+                        "Order Management New Feature",
+                        "CRM Update",
+                        "Match File",
+                        "Dist Code Import",
+                        "Other",
+                    ],
+                )
+                priority = st.selectbox(
+                    "Priority *",
+                    options=["Low", "Medium", "High", "Urgent"],
+                    index=1,
+                )
+
+            with col2:
+                due_date = st.date_input("Target Due Date (optional)", value=None, min_value=date.today())
+                attachment = st.file_uploader(
+                    "Attachment (optional)",
+                    type=["csv", "xlsx", "pdf", "png", "jpg", "txt", "docx"],
+                    help="Upload a screenshot, file, or reference document",
+                )
+
+            description = st.text_area(
+                "Description *",
+                height=180,
+                placeholder="Describe your request in detail...\n\n"
+                            "For data fixes: include the client name, date range, and what looks wrong.\n"
+                            "For order management: include the client and specific changes needed.\n"
+                            "For features: describe what you'd like to see and why.",
             )
-            priority = st.selectbox(
-                "Priority *",
-                options=["Low", "Medium", "High", "Urgent"],
-                index=1,
-            )
 
-        with col2:
-            due_date = st.date_input("Target Due Date (optional)", value=None, min_value=date.today())
-            attachment = st.file_uploader(
-                "Attachment (optional)",
-                type=["csv", "xlsx", "pdf", "png", "jpg", "txt", "docx"],
-                help="Upload a screenshot, file, or reference document",
-            )
+            submitted = st.form_submit_button("Submit Request", use_container_width=True, type="primary")
 
-        description = st.text_area(
-            "Description *",
-            height=180,
-            placeholder="Describe your request in detail...\n\n"
-                        "For data fixes: include the client name, date range, and what looks wrong.\n"
-                        "For order management: include the client and specific changes needed.\n"
-                        "For features: describe what you'd like to see and why.",
-        )
+        if submitted:
+            if not description.strip():
+                st.error("Please provide a description of your request.")
+            else:
+                ticket = {
+                    "submitter_name": user_name,
+                    "submitter_email": user_email,
+                    "request_type": request_type,
+                    "priority": priority,
+                    "due_date": due_date.strftime("%B %d, %Y") if due_date else "Not specified",
+                    "description": description.strip(),
+                }
 
-        submitted = st.form_submit_button("Submit Request", use_container_width=True, type="primary")
+                attach_bytes = None
+                attach_name = None
+                if attachment:
+                    attach_bytes = attachment.read()
+                    attach_name = attachment.name
 
-    if submitted:
-        if not description.strip():
-            st.error("Please provide a description of your request.")
-        else:
-            ticket = {
-                "submitter_name": user_name,
-                "submitter_email": user_email,
-                "request_type": request_type,
-                "priority": priority,
-                "due_date": due_date.strftime("%B %d, %Y") if due_date else "Not specified",
-                "description": description.strip(),
-            }
+                with st.spinner("Submitting your request..."):
+                    # Always save to database first
+                    save_ticket(ticket)
 
-            attach_bytes = None
-            attach_name = None
-            if attachment:
-                attach_bytes = attachment.read()
-                attach_name = attachment.name
+                    # Try email (best-effort)
+                    email_sent = try_send_email(ticket, attach_bytes, attach_name)
 
-            with st.spinner("Submitting your request..."):
-                try:
-                    success = send_ticket_email(ticket, attach_bytes, attach_name)
-                    if success:
-                        st.success("Your request has been submitted successfully! "
-                                   "You'll receive a response from the data team shortly.")
-                        st.balloons()
+                    if email_sent:
+                        st.success("Your request has been submitted and the team has been notified!")
                     else:
-                        st.error("There was an issue sending your request. Please try again or email "
-                                 "scott.phillips@affinitysales.com directly.")
-                except Exception as e:
-                    st.error(f"Error submitting request: {str(e)[:200]}\n\n"
-                             "Please email scott.phillips@affinitysales.com directly.")
+                        st.success("Your request has been submitted and saved! "
+                                   "The team will review it shortly.")
+                    st.balloons()
+
+    # ── My Tickets Tab ──
+    with tab_my_tickets:
+        st.markdown("### Your Requests")
+        tickets = get_user_tickets(user_email)
+
+        if not tickets:
+            st.info("You haven't submitted any requests yet.")
+        else:
+            open_tickets = [t for t in tickets if t[4] == "OPEN"]
+            closed_tickets = [t for t in tickets if t[4] == "COMPLETED"]
+
+            if open_tickets:
+                st.markdown(f"**Open Requests ({len(open_tickets)})**")
+                for t in open_tickets:
+                    ticket_id, req_type, pri, desc, status, created, due = t
+                    pri_emoji = {"Low": "🟢", "Medium": "🟡", "High": "🔴", "Urgent": "🟣"}.get(pri, "⚪")
+                    created_str = created.strftime("%b %d, %Y") if created else ""
+                    with st.expander(f"{pri_emoji} **{req_type}** — {created_str}"):
+                        st.markdown(f"**Priority:** {pri}  |  **Due:** {due}  |  **Status:** {status}")
+                        st.markdown(f"**Description:**\n\n{desc}")
+
+            if closed_tickets:
+                st.markdown(f"**Completed ({len(closed_tickets)})**")
+                for t in closed_tickets:
+                    ticket_id, req_type, pri, desc, status, created, due = t
+                    created_str = created.strftime("%b %d, %Y") if created else ""
+                    with st.expander(f"✅ **{req_type}** — {created_str}"):
+                        st.markdown(f"**Priority:** {pri}  |  **Due:** {due}  |  **Status:** {status}")
+                        st.markdown(f"**Description:**\n\n{desc}")
+
+    # ── Admin Tab (Scott only) ──
+    if is_admin:
+        with tab_admin:
+            st.markdown("### All Open Tickets")
+
+            open_tickets = get_all_open_tickets()
+
+            if not open_tickets:
+                st.success("No open tickets! All caught up.")
+            else:
+                st.markdown(f"**{len(open_tickets)} open request(s)**")
+                for t in open_tickets:
+                    ticket_id, name, email, req_type, pri, desc, created, due = t
+                    pri_emoji = {"Low": "🟢", "Medium": "🟡", "High": "🔴", "Urgent": "🟣"}.get(pri, "⚪")
+                    created_str = created.strftime("%b %d, %Y %I:%M %p") if created else ""
+
+                    with st.expander(f"{pri_emoji} **{req_type}** — {name} ({created_str})"):
+                        st.markdown(f"**From:** {name} ({email})")
+                        st.markdown(f"**Priority:** {pri}  |  **Due:** {due}")
+                        st.markdown(f"**Description:**\n\n{desc}")
+                        if st.button("✅ Mark Complete", key=f"complete_{ticket_id}", type="primary"):
+                            mark_ticket_complete(ticket_id)
+                            st.success(f"Ticket #{ticket_id} marked as complete!")
+                            st.rerun()
+
+            # Completed section
+            st.markdown("---")
+            with st.expander("View Completed Tickets"):
+                completed = get_completed_tickets()
+                if not completed:
+                    st.info("No completed tickets yet.")
+                else:
+                    for t in completed:
+                        ticket_id, name, req_type, pri, desc, created, completed_at = t
+                        created_str = created.strftime("%b %d") if created else ""
+                        completed_str = completed_at.strftime("%b %d") if completed_at else ""
+                        st.markdown(f"- ✅ **{req_type}** from {name} "
+                                    f"(submitted {created_str}, completed {completed_str})")
 
     # Footer
     st.markdown("---")
@@ -418,6 +534,6 @@ def show_ticket_form():
 
 # ─── MAIN ───
 if st.session_state.get("logged_in"):
-    show_ticket_form()
+    show_main_app()
 else:
     show_login()

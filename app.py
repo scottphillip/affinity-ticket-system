@@ -4,12 +4,15 @@ Affinity Group - Ticket Submission System
 Standalone Streamlit app for submitting data requests, bug reports,
 and feature requests. Sends tickets directly to scott.phillips@affinitysales.com
 via Microsoft Graph API.
+
+Employee directory enables single-field identification (email or name lookup).
 """
 import streamlit as st
 import requests
 import json
 import base64
 from datetime import datetime, date
+from pathlib import Path
 
 st.set_page_config(
     page_title="Submit a Request | Affinity Group",
@@ -20,6 +23,27 @@ st.set_page_config(
 # Brand colors
 ORANGE = "#F5921E"
 CHARCOAL = "#2D2D2D"
+
+
+# ─── Employee Directory ───
+@st.cache_data
+def load_employee_directory():
+    """Load employee directory (email -> name mapping)."""
+    dir_path = Path(__file__).parent / "employee_directory.json"
+    if dir_path.exists():
+        with open(dir_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def get_directory_options():
+    """Build display options: 'Name (email)' sorted by name."""
+    directory = load_employee_directory()
+    # Build both lookups
+    options = []
+    for email, name in sorted(directory.items(), key=lambda x: x[1].lower()):
+        options.append({"display": f"{name} ({email})", "name": name, "email": email})
+    return options
 
 
 # ─── Microsoft Graph Email ───
@@ -143,30 +167,51 @@ st.markdown("Submit a request for data additions, fixes, feature requests, or bu
 
 st.markdown("---")
 
+# Load directory
+directory_options = get_directory_options()
+display_list = [""] + [opt["display"] for opt in directory_options]
+
 # Form
 with st.form("ticket_form", clear_on_submit=True):
     col1, col2 = st.columns(2)
 
     with col1:
-        submitter_name = st.text_input("Your Name *", placeholder="Jane Smith")
+        # Single identity field - searchable selectbox
+        selected = st.selectbox(
+            "Who are you? *",
+            options=display_list,
+            index=0,
+            help="Start typing your name or email to search",
+            placeholder="Search by name or email...",
+        )
+
         request_type = st.selectbox(
             "Request Type *",
-            options=["New Client Onboarding", "Data Fix / Correction", "Feature Request",
-                     "Bug Report", "Report / Dashboard Request", "Other"]
+            options=[
+                "Data Fix / Correction",
+                "Feature Request",
+                "Bug Report",
+                "Report / Dashboard Request",
+                "Order Management Update",
+                "Order Management New Feature",
+                "CRM Update",
+                "Match File",
+                "Dist Code Import",
+                "Other",
+            ],
         )
         priority = st.selectbox(
             "Priority *",
             options=["Low", "Medium", "High", "Urgent"],
-            index=1
+            index=1,
         )
 
     with col2:
-        submitter_email = st.text_input("Your Email *", placeholder="jane.smith@affinitysales.com")
         due_date = st.date_input("Target Due Date (optional)", value=None, min_value=date.today())
         attachment = st.file_uploader(
             "Attachment (optional)",
             type=["csv", "xlsx", "pdf", "png", "jpg", "txt", "docx"],
-            help="Upload a screenshot, file, or reference document"
+            help="Upload a screenshot, file, or reference document",
         )
 
     description = st.text_area(
@@ -174,24 +219,33 @@ with st.form("ticket_form", clear_on_submit=True):
         height=180,
         placeholder="Describe your request in detail...\n\n"
                     "For data fixes: include the client name, date range, and what looks wrong.\n"
-                    "For new clients: include the client name and any files/contacts.\n"
-                    "For features: describe what you'd like to see and why."
+                    "For order management: include the client and specific changes needed.\n"
+                    "For features: describe what you'd like to see and why.",
     )
 
     submitted = st.form_submit_button("Submit Request", use_container_width=True, type="primary")
 
 if submitted:
+    # Resolve name/email from selection
+    submitter_name = ""
+    submitter_email = ""
+    if selected:
+        # Find the matching entry
+        for opt in directory_options:
+            if opt["display"] == selected:
+                submitter_name = opt["name"]
+                submitter_email = opt["email"]
+                break
+
     # Validate required fields
-    if not submitter_name.strip():
-        st.error("Please enter your name.")
-    elif not submitter_email.strip() or "@" not in submitter_email:
-        st.error("Please enter a valid email address.")
+    if not submitter_name or not submitter_email:
+        st.error("Please select your name from the directory.")
     elif not description.strip():
         st.error("Please provide a description of your request.")
     else:
         ticket = {
-            "submitter_name": submitter_name.strip(),
-            "submitter_email": submitter_email.strip(),
+            "submitter_name": submitter_name,
+            "submitter_email": submitter_email,
             "request_type": request_type,
             "priority": priority,
             "due_date": due_date.strftime("%B %d, %Y") if due_date else "Not specified",

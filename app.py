@@ -8,9 +8,7 @@ sent via email to scott.phillips@affinitysales.com.
 Users log in with their company email + password (stored in Snowflake).
 """
 import streamlit as st
-import requests
 import json
-import base64
 import hashlib
 import snowflake.connector
 from datetime import datetime, date
@@ -192,82 +190,32 @@ def mark_ticket_complete(ticket_id: int):
     )
 
 
-# ─── Microsoft Graph Email (best-effort) ───
+# ─── Email Notification (via Snowflake SYSTEM$SEND_EMAIL) ───
 def try_send_email(ticket: dict, attachment_data: bytes = None, attachment_name: str = None) -> bool:
-    """Attempt to send ticket email. Returns True if sent, False if failed."""
+    """Send ticket notification via Snowflake's built-in email system."""
     try:
-        tenant_id = st.secrets["graph"]["tenant_id"]
-        client_id = st.secrets["graph"]["client_id"]
-        client_secret = st.secrets["graph"]["client_secret"]
-        sender = st.secrets["graph"]["sender_email"]
-        recipient = st.secrets["graph"]["recipient_email"]
-    except (KeyError, Exception):
-        return False
+        subject = f"[{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}"
+        body = (
+            f"New ticket submitted:\n\n"
+            f"From: {ticket['submitter_name']} ({ticket['submitter_email']})\n"
+            f"Type: {ticket['request_type']}\n"
+            f"Priority: {ticket['priority']}\n"
+            f"Due: {ticket.get('due_date', 'Not specified')}\n"
+            f"Submitted: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}\n\n"
+            f"Description:\n{ticket['description']}"
+        )
+        # Escape single quotes for SQL
+        subject_safe = subject.replace("'", "''")
+        body_safe = body.replace("'", "''")
 
-    try:
-        # Get token
-        token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://graph.microsoft.com/.default",
-        }
-        resp = requests.post(token_url, data=payload, timeout=10)
-        resp.raise_for_status()
-        token = resp.json()["access_token"]
-
-        # Build email
-        priority_colors = {"Low": "#4CAF50", "Medium": "#FF9800", "High": "#F44336", "Urgent": "#9C27B0"}
-        p_color = priority_colors.get(ticket["priority"], "#666")
-
-        html_body = f"""
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <div style="background: {CHARCOAL}; padding: 15px 20px; border-radius: 8px 8px 0 0;">
-                <span style="color: {ORANGE}; font-size: 18px; font-weight: bold;">TICKET</span>
-                <span style="color: white; font-size: 18px;"> SUBMISSION</span>
-            </div>
-            <div style="border: 1px solid #ddd; border-top: none; padding: 20px; border-radius: 0 0 8px 8px;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr><td style="padding: 8px 0; font-weight: bold; width: 140px; color: #555;">Submitted By:</td>
-                        <td style="padding: 8px 0;">{ticket['submitter_name']} ({ticket['submitter_email']})</td></tr>
-                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Request Type:</td>
-                        <td style="padding: 8px 0;">{ticket['request_type']}</td></tr>
-                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Priority:</td>
-                        <td style="padding: 8px 0;"><span style="background: {p_color}; color: white; padding: 3px 10px; border-radius: 12px; font-size: 13px;">{ticket['priority']}</span></td></tr>
-                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Due Date:</td>
-                        <td style="padding: 8px 0;">{ticket.get('due_date', 'Not specified')}</td></tr>
-                    <tr><td style="padding: 8px 0; font-weight: bold; color: #555;">Submitted:</td>
-                        <td style="padding: 8px 0;">{datetime.now().strftime('%B %d, %Y at %I:%M %p')}</td></tr>
-                </table>
-                <hr style="border: none; border-top: 1px solid #eee; margin: 15px 0;">
-                <p style="font-weight: bold; color: #555; margin-bottom: 5px;">Description:</p>
-                <div style="background: #f9f9f9; padding: 12px; border-radius: 6px; white-space: pre-wrap;">{ticket['description']}</div>
-            </div>
-        </div>
-        """
-
-        message = {
-            "message": {
-                "subject": f"[{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}",
-                "body": {"contentType": "HTML", "content": html_body},
-                "toRecipients": [{"emailAddress": {"address": recipient}}],
-            },
-            "saveToSentItems": "true",
-        }
-
-        if attachment_data and attachment_name:
-            encoded = base64.b64encode(attachment_data).decode("utf-8")
-            message["message"]["attachments"] = [{
-                "@odata.type": "#microsoft.graph.fileAttachment",
-                "name": attachment_name,
-                "contentBytes": encoded,
-            }]
-
-        url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        resp = requests.post(url, headers=headers, json=message, timeout=15)
-        return resp.status_code in (200, 202)
+        run_query(
+            f"CALL SYSTEM$SEND_EMAIL("
+            f"'AFFINITY_EMAIL_NOTIFICATION_INTEGRATION', "
+            f"'{ADMIN_EMAIL}', "
+            f"'{subject_safe}', "
+            f"'{body_safe}')"
+        )
+        return True
     except Exception:
         return False
 

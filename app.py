@@ -5,12 +5,13 @@ Standalone Streamlit app for submitting data requests, bug reports,
 and feature requests. Sends tickets directly to scott.phillips@affinitysales.com
 via Microsoft Graph API.
 
-Employee directory enables single-field identification (email or name lookup).
+Users log in with their company email (validated against employee directory).
 """
 import streamlit as st
 import requests
 import json
 import base64
+import hashlib
 from datetime import datetime, date
 from pathlib import Path
 
@@ -36,14 +37,44 @@ def load_employee_directory():
     return {}
 
 
-def get_directory_options():
-    """Build display options: 'Name (email)' sorted by name."""
+# ─── Password Storage ───
+# Passwords stored in secrets as a pre-built dict, OR users set on first login.
+# For Streamlit Cloud, passwords persist via secrets TOML.
+# Fallback: session-only passwords (user re-enters each session).
+
+def get_stored_passwords() -> dict:
+    """Get password hashes from secrets (if configured)."""
+    try:
+        return dict(st.secrets.get("passwords", {}))
+    except Exception:
+        return {}
+
+
+def hash_password(password: str) -> str:
+    """Simple SHA-256 hash for password storage."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_login(email: str, password: str) -> bool:
+    """Verify email is in directory and password matches (if passwords configured)."""
     directory = load_employee_directory()
-    # Build both lookups
-    options = []
-    for email, name in sorted(directory.items(), key=lambda x: x[1].lower()):
-        options.append({"display": f"{name} ({email})", "name": name, "email": email})
-    return options
+    email_lower = email.strip().lower()
+
+    # Must be in employee directory
+    if email_lower not in directory:
+        return False
+
+    # Check stored passwords
+    stored = get_stored_passwords()
+    if stored:
+        stored_hash = stored.get(email_lower)
+        if stored_hash:
+            return hash_password(password) == stored_hash
+        # Email in directory but no password set yet - allow first login
+        return True
+
+    # No password system configured - just validate email is in directory
+    return True
 
 
 # ─── Microsoft Graph Email ───
@@ -71,7 +102,6 @@ def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_na
     sender = st.secrets["graph"]["sender_email"]
     recipient = st.secrets["graph"]["recipient_email"]
 
-    # Build HTML email body
     priority_colors = {
         "Low": "#4CAF50",
         "Medium": "#FF9800",
@@ -120,7 +150,6 @@ def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_na
     </div>
     """
 
-    # Build email message
     message = {
         "message": {
             "subject": f"[{ticket['priority']}] {ticket['request_type']} - from {ticket['submitter_name']}",
@@ -133,7 +162,6 @@ def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_na
         "saveToSentItems": "true",
     }
 
-    # Add attachment if provided
     if attachment_data and attachment_name:
         encoded = base64.b64encode(attachment_data).decode("utf-8")
         message["message"]["attachments"] = [
@@ -144,7 +172,6 @@ def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_na
             }
         ]
 
-    # Send via Graph
     url = f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -154,125 +181,202 @@ def send_ticket_email(ticket: dict, attachment_data: bytes = None, attachment_na
     return response.status_code in (200, 202)
 
 
-# ─── UI ───
-st.markdown(f"""
-<div style="background: {CHARCOAL}; padding: 15px 25px; border-radius: 10px; margin-bottom: 25px;">
-    <span style="color: {ORANGE}; font-size: 22px; font-weight: bold;">AFFINITY GROUP</span>
-    <span style="color: white; font-size: 22px; font-weight: 300;"> REQUEST PORTAL</span>
-</div>
-""", unsafe_allow_html=True)
+# ─── LOGIN PAGE ───
+def show_login():
+    """Display the login form."""
+    st.markdown(f"""
+    <div style="background: {CHARCOAL}; padding: 15px 25px; border-radius: 10px; margin-bottom: 25px;">
+        <span style="color: {ORANGE}; font-size: 22px; font-weight: bold;">AFFINITY GROUP</span>
+        <span style="color: white; font-size: 22px; font-weight: 300;"> REQUEST PORTAL</span>
+    </div>
+    """, unsafe_allow_html=True)
 
-st.markdown("Submit a request for data additions, fixes, feature requests, or bug reports. "
-            "Your ticket will be sent directly to the data engineering team.")
+    st.markdown("### Sign In")
+    st.markdown("Enter your Affinity Group email and password to continue.")
 
-st.markdown("---")
+    with st.form("login_form"):
+        email = st.text_input("Email", placeholder="yourname@affinitysales.com")
+        password = st.text_input("Password", type="password", placeholder="Enter your password")
+        col_login, col_register = st.columns(2)
+        with col_login:
+            login_btn = st.form_submit_button("Sign In", use_container_width=True, type="primary")
+        with col_register:
+            register_btn = st.form_submit_button("Create Account", use_container_width=True)
 
-# Load directory
-directory_options = get_directory_options()
-display_list = [""] + [opt["display"] for opt in directory_options]
+    if login_btn:
+        if not email or not password:
+            st.error("Please enter both email and password.")
+            return
 
-# Form
-with st.form("ticket_form", clear_on_submit=True):
-    col1, col2 = st.columns(2)
+        email_lower = email.strip().lower()
+        directory = load_employee_directory()
 
-    with col1:
-        # Single identity field - searchable selectbox
-        selected = st.selectbox(
-            "Who are you? *",
-            options=display_list,
-            index=0,
-            help="Start typing your name or email to search",
-            placeholder="Search by name or email...",
+        if email_lower not in directory:
+            st.error("Email not found in the Affinity Group directory. "
+                     "Please use your company email address.")
+            return
+
+        # Check password against session store
+        if "user_passwords" not in st.session_state:
+            st.session_state.user_passwords = get_stored_passwords()
+
+        stored_hash = st.session_state.user_passwords.get(email_lower)
+        if stored_hash and stored_hash != hash_password(password):
+            st.error("Incorrect password. Please try again.")
+            return
+
+        if not stored_hash:
+            # First time - save their password
+            st.session_state.user_passwords[email_lower] = hash_password(password)
+
+        # Login success
+        st.session_state.logged_in = True
+        st.session_state.user_email = email_lower
+        st.session_state.user_name = directory[email_lower]
+        st.rerun()
+
+    if register_btn:
+        if not email or not password:
+            st.error("Please enter both email and password to create your account.")
+            return
+
+        email_lower = email.strip().lower()
+        directory = load_employee_directory()
+
+        if email_lower not in directory:
+            st.error("Email not found in the Affinity Group directory. "
+                     "Only Affinity Group employees can create accounts.")
+            return
+
+        if len(password) < 4:
+            st.error("Password must be at least 4 characters.")
+            return
+
+        # Store password
+        if "user_passwords" not in st.session_state:
+            st.session_state.user_passwords = get_stored_passwords()
+
+        st.session_state.user_passwords[email_lower] = hash_password(password)
+        st.session_state.logged_in = True
+        st.session_state.user_email = email_lower
+        st.session_state.user_name = directory[email_lower]
+        st.success(f"Account created! Welcome, {directory[email_lower]}.")
+        st.rerun()
+
+
+# ─── TICKET FORM (after login) ───
+def show_ticket_form():
+    """Display the ticket submission form for logged-in users."""
+    user_name = st.session_state.user_name
+    user_email = st.session_state.user_email
+
+    st.markdown(f"""
+    <div style="background: {CHARCOAL}; padding: 15px 25px; border-radius: 10px; margin-bottom: 25px;">
+        <span style="color: {ORANGE}; font-size: 22px; font-weight: bold;">AFFINITY GROUP</span>
+        <span style="color: white; font-size: 22px; font-weight: 300;"> REQUEST PORTAL</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # User info bar
+    col_user, col_logout = st.columns([4, 1])
+    with col_user:
+        st.markdown(f"Logged in as **{user_name}** ({user_email})")
+    with col_logout:
+        if st.button("Sign Out", type="secondary"):
+            st.session_state.logged_in = False
+            st.session_state.user_email = None
+            st.session_state.user_name = None
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("Submit a request for data additions, fixes, feature requests, or bug reports. "
+                "Your ticket will be sent directly to the data engineering team.")
+
+    # Form
+    with st.form("ticket_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            request_type = st.selectbox(
+                "Request Type *",
+                options=[
+                    "Data Fix / Correction",
+                    "Feature Request",
+                    "Bug Report",
+                    "Report / Dashboard Request",
+                    "Order Management Update",
+                    "Order Management New Feature",
+                    "CRM Update",
+                    "Match File",
+                    "Dist Code Import",
+                    "Other",
+                ],
+            )
+            priority = st.selectbox(
+                "Priority *",
+                options=["Low", "Medium", "High", "Urgent"],
+                index=1,
+            )
+
+        with col2:
+            due_date = st.date_input("Target Due Date (optional)", value=None, min_value=date.today())
+            attachment = st.file_uploader(
+                "Attachment (optional)",
+                type=["csv", "xlsx", "pdf", "png", "jpg", "txt", "docx"],
+                help="Upload a screenshot, file, or reference document",
+            )
+
+        description = st.text_area(
+            "Description *",
+            height=180,
+            placeholder="Describe your request in detail...\n\n"
+                        "For data fixes: include the client name, date range, and what looks wrong.\n"
+                        "For order management: include the client and specific changes needed.\n"
+                        "For features: describe what you'd like to see and why.",
         )
 
-        request_type = st.selectbox(
-            "Request Type *",
-            options=[
-                "Data Fix / Correction",
-                "Feature Request",
-                "Bug Report",
-                "Report / Dashboard Request",
-                "Order Management Update",
-                "Order Management New Feature",
-                "CRM Update",
-                "Match File",
-                "Dist Code Import",
-                "Other",
-            ],
-        )
-        priority = st.selectbox(
-            "Priority *",
-            options=["Low", "Medium", "High", "Urgent"],
-            index=1,
-        )
+        submitted = st.form_submit_button("Submit Request", use_container_width=True, type="primary")
 
-    with col2:
-        due_date = st.date_input("Target Due Date (optional)", value=None, min_value=date.today())
-        attachment = st.file_uploader(
-            "Attachment (optional)",
-            type=["csv", "xlsx", "pdf", "png", "jpg", "txt", "docx"],
-            help="Upload a screenshot, file, or reference document",
-        )
+    if submitted:
+        if not description.strip():
+            st.error("Please provide a description of your request.")
+        else:
+            ticket = {
+                "submitter_name": user_name,
+                "submitter_email": user_email,
+                "request_type": request_type,
+                "priority": priority,
+                "due_date": due_date.strftime("%B %d, %Y") if due_date else "Not specified",
+                "description": description.strip(),
+            }
 
-    description = st.text_area(
-        "Description *",
-        height=180,
-        placeholder="Describe your request in detail...\n\n"
-                    "For data fixes: include the client name, date range, and what looks wrong.\n"
-                    "For order management: include the client and specific changes needed.\n"
-                    "For features: describe what you'd like to see and why.",
-    )
+            attach_bytes = None
+            attach_name = None
+            if attachment:
+                attach_bytes = attachment.read()
+                attach_name = attachment.name
 
-    submitted = st.form_submit_button("Submit Request", use_container_width=True, type="primary")
+            with st.spinner("Submitting your request..."):
+                try:
+                    success = send_ticket_email(ticket, attach_bytes, attach_name)
+                    if success:
+                        st.success("Your request has been submitted successfully! "
+                                   "You'll receive a response from the data team shortly.")
+                        st.balloons()
+                    else:
+                        st.error("There was an issue sending your request. Please try again or email "
+                                 "scott.phillips@affinitysales.com directly.")
+                except Exception as e:
+                    st.error(f"Error submitting request: {str(e)[:200]}\n\n"
+                             "Please email scott.phillips@affinitysales.com directly.")
 
-if submitted:
-    # Resolve name/email from selection
-    submitter_name = ""
-    submitter_email = ""
-    if selected:
-        # Find the matching entry
-        for opt in directory_options:
-            if opt["display"] == selected:
-                submitter_name = opt["name"]
-                submitter_email = opt["email"]
-                break
+    # Footer
+    st.markdown("---")
+    st.caption("Affinity Group Data Engineering | Questions? Contact scott.phillips@affinitysales.com")
 
-    # Validate required fields
-    if not submitter_name or not submitter_email:
-        st.error("Please select your name from the directory.")
-    elif not description.strip():
-        st.error("Please provide a description of your request.")
-    else:
-        ticket = {
-            "submitter_name": submitter_name,
-            "submitter_email": submitter_email,
-            "request_type": request_type,
-            "priority": priority,
-            "due_date": due_date.strftime("%B %d, %Y") if due_date else "Not specified",
-            "description": description.strip(),
-        }
 
-        # Handle attachment
-        attach_bytes = None
-        attach_name = None
-        if attachment:
-            attach_bytes = attachment.read()
-            attach_name = attachment.name
-
-        with st.spinner("Submitting your request..."):
-            try:
-                success = send_ticket_email(ticket, attach_bytes, attach_name)
-                if success:
-                    st.success("Your request has been submitted successfully! "
-                               "You'll receive a response from the data team shortly.")
-                    st.balloons()
-                else:
-                    st.error("There was an issue sending your request. Please try again or email "
-                             "scott.phillips@affinitysales.com directly.")
-            except Exception as e:
-                st.error(f"Error submitting request: {str(e)[:200]}\n\n"
-                         "Please email scott.phillips@affinitysales.com directly.")
-
-# Footer
-st.markdown("---")
-st.caption("Affinity Group Data Engineering | Questions? Contact scott.phillips@affinitysales.com")
+# ─── MAIN ───
+if st.session_state.get("logged_in"):
+    show_ticket_form()
+else:
+    show_login()
